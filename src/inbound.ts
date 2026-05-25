@@ -403,6 +403,35 @@ async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem,
   await sendTextToTarget(client, target, text);
 }
 
+// ───────── inbound safety guards (xcph fork) ─────────
+// 1) size cap: pasted source / long text shouldn't be fed into LLM context
+// 2) rate limit: >N msgs in 10s from same sender → 30s cooldown
+const INBOUND_MAX_BODY_CHARS = 4096;
+const RATE_WINDOW_MS = 10 * 1000;
+const RATE_MAX_IN_WINDOW = 3;
+const RATE_COOLDOWN_MS = 30 * 1000;
+const inboundRateBuckets = new Map<string, number[]>();
+const inboundCooldownUntil = new Map<string, number>();
+
+type RateGateResult =
+  | { allowed: true }
+  | { allowed: false; reason: "cooldown" | "burst"; remainingMs: number };
+
+function rateGate(senderId: string): RateGateResult {
+  const now = Date.now();
+  const until = inboundCooldownUntil.get(senderId) || 0;
+  if (until > now) return { allowed: false, reason: "cooldown", remainingMs: until - now };
+  const arr = (inboundRateBuckets.get(senderId) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  arr.push(now);
+  inboundRateBuckets.set(senderId, arr);
+  if (arr.length > RATE_MAX_IN_WINDOW) {
+    inboundCooldownUntil.set(senderId, now + RATE_COOLDOWN_MS);
+    return { allowed: false, reason: "burst", remainingMs: RATE_COOLDOWN_MS };
+  }
+  return { allowed: true };
+}
+// ─────────────────────────────────────────────────────
+
 // ───────── deterministic file-delivery shortcut (xcph fork) ─────────
 // LLM 即使被强提示也常常把 read_file 内容当文本回贴。这里抢在 dispatch 前
 // 做模式匹配,匹配到"发文件回去"意图就直接调 sendFile/Image/VideoToTarget,
@@ -504,7 +533,37 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
 
   await prefetchInboundMediaToWorkspace(msg);
   const inbound = extractInboundBody(msg);
-  api.logger?.info?.(`[openim] inbound body: ${inbound.body}`);
+  const bodyLen = (inbound.body || "").length;
+  api.logger?.info?.(`[openim] inbound body (${bodyLen} chars): ${(inbound.body || "").slice(0, 200)}`);
+
+  // 🔒 guard 1: size cap — overlong (pasted source / long text) → reject, no LLM
+  if (bodyLen > INBOUND_MAX_BODY_CHARS) {
+    api.logger?.warn?.(`[openim] body too long (${bodyLen}), rejecting`);
+    try {
+      await sendReplyFromInbound(
+        client, msg,
+        `⚠️ 消息太长 (${bodyLen} 字符,上限 ${INBOUND_MAX_BODY_CHARS})。请用 📎 附件上传文件,而不是把内容粘进聊天。`,
+      );
+    } catch { /* ignore */ }
+    return;
+  }
+
+  // 🔒 guard 2: rate limit — >3 msgs in 10s from same sender → 30s cooldown
+  const senderRateId = String((msg as any).sendID || "anon");
+  const gate = rateGate(senderRateId);
+  if (!gate.allowed) {
+    api.logger?.warn?.(`[openim] rate-gated sender=${senderRateId} reason=${gate.reason} remainingMs=${gate.remainingMs}`);
+    if (gate.reason === "burst") {
+      try {
+        await sendReplyFromInbound(
+          client, msg,
+          `⏳ 收到太多消息,休息 ${Math.ceil(gate.remainingMs / 1000)}s 再继续。`,
+        );
+      } catch { /* ignore */ }
+    }
+    return;
+  }
+
   // ✂️ deterministic short-circuit: "把 X 发给我" → 直接 send_file/image/video, 不经 LLM
   if (inbound.body && (msg as any).contentType === 101) {
     const delivered = await tryDeterministicFileDelivery(client, msg, inbound.body);
