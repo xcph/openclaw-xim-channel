@@ -67,8 +67,20 @@ async function readLocalAsFile(pathInput: string, forcedName?: string): Promise<
   return { file, filePath, fileName, size: st.size, mime };
 }
 
+// ─── outbound size cap (xcph fork) ───
+// Agent occasionally echoes back giant inbound payloads (SDK source / long text).
+// Cap outbound text at 4KB at the SDK send layer so peer clients don't see them.
+const OUTBOUND_MAX_TEXT_CHARS = 4096;
+function capOutboundText(text: string): string {
+  if (typeof text !== "string") return String(text ?? "");
+  if (text.length <= OUTBOUND_MAX_TEXT_CHARS) return text;
+  const head = text.slice(0, OUTBOUND_MAX_TEXT_CHARS - 80);
+  return `${head}\n\n…[truncated ${text.length - head.length} chars by channel guard]`;
+}
+
 export async function sendTextToTarget(client: OpenIMClientState, target: ParsedTarget, text: string): Promise<void> {
-  const created = await client.sdk.createTextMessage(text);
+  const safe = capOutboundText(text);
+  const created = await client.sdk.createTextMessage(safe);
   const message = created?.data;
   if (!message) throw new Error("createTextMessage failed");
 
