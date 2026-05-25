@@ -42,6 +42,27 @@ async function prefetchOne(url: string | undefined, sendID: string, fileName: st
   } catch (_e) { return false; }
 }
 
+// ───────── channel operator hint (xcph fork) ─────────
+// Inline a small system-style block ahead of the user text so the LLM picks
+// the right openim_send_{file|image|video} tool when delivery is requested.
+function buildChannelOperatorHint(args: { senderId: string; isGroup: boolean; groupId: string }): string {
+  const { senderId, isGroup, groupId } = args;
+  const target = isGroup ? `group:${groupId}` : `user:${senderId}`;
+  const wsPath = `/home/node/.openclaw/workspace/${senderId}/`;
+  return [
+    `[Channel: OpenIM]`,
+    `- Sender: ${senderId}; reply target = ${target}`,
+    `- Workspace dir (already prefetched any user attachments): ${wsPath}`,
+    `- When the user asks you to send / give / forward / 发 / 给我 a file BACK to them:`,
+    `  · *.png / *.jpg / *.jpeg / *.gif / *.webp / *.bmp  -> call openim_send_image({target:"${target}", image:"${wsPath}<name>"})`,
+    `  · *.mp4 / *.mov / *.mkv / *.webm                   -> call openim_send_video({target:"${target}", video:"${wsPath}<name>"})`,
+    `  · everything else                                  -> call openim_send_file({target:"${target}", file:"${wsPath}<name>"})`,
+    `- Never paste binary / file content as a text reply when delivery is requested.`,
+    `- read_file is only for *answering questions about* the file's content, not for delivery.`,
+  ].join("\n");
+}
+// ──────────────────────────────────────────────────────
+
 export async function prefetchInboundMediaToWorkspace(msg: MessageItem): Promise<void> {
   const sendID = String((msg as any)?.sendID || "");
   if (!sendID) return;
@@ -440,7 +461,9 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   const timestamp = msg.sendTime || Date.now();
   const mediaResult = await materializeInboundMedia(inbound.media);
   const warningText = mediaResult.warnings.map((warning) => `[Media fetch failed] ${warning}`).join("\n");
-  const rawBody = warningText ? `${inbound.body}\n${warningText}` : inbound.body;
+  const channelHint = buildChannelOperatorHint({ senderId, isGroup: group, groupId: String(msg.groupID || "") });
+  const userText = warningText ? `${inbound.body}\n${warningText}` : inbound.body;
+  const rawBody = `${channelHint}\n\n[Message]\n${userText}`;
   const body = buildTextEnvelope(runtime, cfg, fromLabel, senderId, timestamp, rawBody, chatType);
 
   if (mediaResult.warnings.length > 0) {
