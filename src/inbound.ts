@@ -1,5 +1,5 @@
 import { SessionType, type MessageItem } from "@openim/client-sdk";
-import { sendTextToTarget } from "./media";
+import { sendFileToTarget, sendImageToTarget, sendTextToTarget, sendVideoToTarget } from "./media";
 import type { ChatType, InboundBodyResult, InboundMediaItem, OpenIMClientState, ParsedTarget } from "./types";
 import { formatSdkError } from "./utils";
 
@@ -403,6 +403,91 @@ async function sendReplyFromInbound(client: OpenIMClientState, msg: MessageItem,
   await sendTextToTarget(client, target, text);
 }
 
+// ───────── deterministic file-delivery shortcut (xcph fork) ─────────
+// LLM 即使被强提示也常常把 read_file 内容当文本回贴。这里抢在 dispatch 前
+// 做模式匹配,匹配到"发文件回去"意图就直接调 sendFile/Image/VideoToTarget,
+// 绕过 LLM。不匹配 → 落到原流程让 LLM 决策。
+const FILE_INTENT_PATTERNS: RegExp[] = [
+  /把\s*(?<n>[^\s,，。!?]+)\s*(?:发|传|拿|拷)\s*(?:给|过|回)\s*(?:我|来)/u,
+  /(?<n>[^\s,，。!?]+)\s*发\s*(?:给|过|回)\s*(?:我|来)/u,
+  /(?:发|传)(?:\s*(?:给|过|回))?(?:\s*我)?\s+(?<n>[A-Za-z0-9_\-\.]+\.[A-Za-z0-9]{1,8})/iu,
+  /(?:send|forward|give)\s+me\s+(?<n>[A-Za-z0-9_\-\.]+\.[A-Za-z0-9]{1,8})/iu,
+];
+
+function detectFileIntent(text: string | undefined): string | null {
+  const stripped = (text || "").trim();
+  if (!stripped) return null;
+  for (const re of FILE_INTENT_PATTERNS) {
+    const m = stripped.match(re);
+    if (m && m.groups && m.groups.n) {
+      const name = m.groups.n.trim().replace(/^["'`]+|["'`]+$/g, "");
+      if (name) return name;
+    }
+  }
+  return null;
+}
+
+function resolveWorkspaceFile(senderId: string, requested: string): string | null {
+  const dir = `/home/node/.openclaw/workspace/${senderId}`;
+  try { if (!fs.existsSync(dir)) return null; } catch { return null; }
+  const exact = `${dir}/${requested}`;
+  try { if (fs.existsSync(exact) && fs.statSync(exact).isFile()) return exact; } catch {}
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const lower = requested.toLowerCase();
+    for (const e of entries) {
+      if (e.isFile() && e.name.toLowerCase() === lower) return `${dir}/${e.name}`;
+    }
+    const prefix = lower.replace(/\.[^.]+$/, "");
+    const matches = entries
+      .filter((e) => e.isFile() && e.name.toLowerCase().startsWith(prefix))
+      .map((e) => {
+        const full = `${dir}/${e.name}`;
+        let mtime = 0; try { mtime = fs.statSync(full).mtimeMs; } catch {}
+        return { name: e.name, full, mtime };
+      })
+      .sort((a, b) => b.mtime - a.mtime);
+    if (matches.length > 0) return matches[0].full;
+  } catch {}
+  return null;
+}
+
+const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
+const VIDEO_EXTS = new Set([".mp4", ".mov", ".mkv", ".webm"]);
+
+async function tryDeterministicFileDelivery(
+  client: OpenIMClientState,
+  msg: MessageItem,
+  text: string,
+): Promise<boolean> {
+  if (!text) return false;
+  const isGroup = isGroupMessage(msg);
+  const senderId = String((msg as any).sendID || "");
+  if (!senderId) return false;
+  const wanted = detectFileIntent(text);
+  if (!wanted) return false;
+  const file = resolveWorkspaceFile(senderId, wanted);
+  if (!file) return false;
+  const target: ParsedTarget = isGroup
+    ? { kind: "group", id: String((msg as any).groupID) }
+    : { kind: "user", id: senderId };
+  const ext = (file.match(/\.[^.]+$/)?.[0] || "").toLowerCase();
+  const fileName = file.split("/").pop() || "file";
+  try {
+    if (IMAGE_EXTS.has(ext)) {
+      await sendImageToTarget(client, target, file);
+    } else if (VIDEO_EXTS.has(ext)) {
+      await sendVideoToTarget(client, target, file, fileName);
+    } else {
+      await sendFileToTarget(client, target, file, fileName);
+    }
+    return true;
+  } catch (_e) {
+    return false;
+  }
+}
+// ──────────────────────────────────────────────────────────────────
+
 export async function processInboundMessage(api: any, client: OpenIMClientState, msg: MessageItem): Promise<void> {
   const runtime = api.runtime;
   if (!runtime?.channel?.reply?.dispatchReplyWithBufferedBlockDispatcher) {
@@ -420,6 +505,14 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
   await prefetchInboundMediaToWorkspace(msg);
   const inbound = extractInboundBody(msg);
   api.logger?.info?.(`[openim] inbound body: ${inbound.body}`);
+  // ✂️ deterministic short-circuit: "把 X 发给我" → 直接 send_file/image/video, 不经 LLM
+  if (inbound.body && (msg as any).contentType === 101) {
+    const delivered = await tryDeterministicFileDelivery(client, msg, inbound.body);
+    if (delivered) {
+      api.logger?.info?.(`[openim] deterministic file delivery satisfied request, skipped LLM`);
+      return;
+    }
+  }
   if (!inbound.body) {
     api.logger?.info?.(
       `[openim] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`
