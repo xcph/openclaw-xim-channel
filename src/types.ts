@@ -36,6 +36,8 @@ export interface InboundMediaItem {
   fileName?: string;
   size?: number;
   snapshotUrl?: string;
+  /** Local workspace path after prefetch (~/.openclaw/workspace/<sendID>/<name>). */
+  workspacePath?: string;
 }
 
 export interface InboundBodyResult {

@@ -8,6 +8,70 @@ const INBOUND_DEDUP_TTL_MS = 5 * 60 * 1000;
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_MS = 15000;
 
+// ───────── workspace prefetch (xcph fork) ─────────
+// inbound 消息处理前,自动下载 fileElem/pictureElem/videoElem 引用的 URL
+// 到 ~/.openclaw/workspace/<sendID>/<fileName>。LLM 因此能 read_file 而不是
+// web_fetch 内网 URL(它有"内网拒读"偏好)。
+import fs from "node:fs";
+import path from "node:path";
+
+const PREFETCH_TIMEOUT_MS = 15000;
+const PREFETCH_MAX_BYTES = 50 * 1024 * 1024;
+const PREFETCH_WORKSPACE = "/home/node/.openclaw/workspace";
+
+async function prefetchOne(url: string | undefined, sendID: string, fileName: string): Promise<boolean> {
+  if (!url || !sendID || !fileName) return false;
+  const dst = path.join(PREFETCH_WORKSPACE, sendID, fileName);
+  try {
+    if (fs.existsSync(dst) && fs.statSync(dst).size > 0) return true;
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PREFETCH_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(url, { signal: controller.signal });
+    } finally { clearTimeout(timer); }
+    if (!response.ok) return false;
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > PREFETCH_MAX_BYTES) return false;
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    if (buffer.byteLength > PREFETCH_MAX_BYTES) return false;
+    fs.writeFileSync(dst, buffer);
+    return true;
+  } catch (_e) { return false; }
+}
+
+export async function prefetchInboundMediaToWorkspace(msg: MessageItem): Promise<void> {
+  const sendID = String((msg as any)?.sendID || "");
+  if (!sendID) return;
+  const tasks: Promise<boolean>[] = [];
+  const file = (msg as any).fileElem;
+  if (file?.sourceUrl && file?.fileName) {
+    tasks.push(prefetchOne(file.sourceUrl, sendID, file.fileName));
+  }
+  const pic = (msg as any).pictureElem;
+  if (pic) {
+    const url = pic.sourcePicture?.url || pic.bigPicture?.url || pic.snapshotPicture?.url;
+    const name = pic.sourcePath || pic.sourcePicture?.uuid || `${Date.now()}.jpg`;
+    if (url) tasks.push(prefetchOne(url, sendID, name));
+  }
+  const vid = (msg as any).videoElem;
+  if (vid?.videoUrl) {
+    const name = vid.videoName || vid.fileName || `${Date.now()}.mp4`;
+    tasks.push(prefetchOne(vid.videoUrl, sendID, name));
+  }
+  await Promise.all(tasks);
+}
+
+function workspacePathOf(sendID: string, fileName: string | undefined): string | undefined {
+  if (!sendID || !fileName) return undefined;
+  const candidate = path.join(PREFETCH_WORKSPACE, sendID, fileName);
+  try { if (fs.existsSync(candidate)) return candidate; } catch (_e) {}
+  return undefined;
+}
+// ─────────────────────────────────────────────────────
+
 type ImagePart = { type: "image"; data: string; mimeType: string };
 
 function normalizeImageMimeType(value: unknown): string | undefined {
@@ -31,6 +95,29 @@ function normalizeSize(value: unknown): number | undefined {
 }
 
 function summarizeMedia(item: InboundMediaItem): string {
+  // Plugin already prefetched media to /home/node/.openclaw/workspace/<sendID>/<fileName>.
+  // When workspacePath is set, hide the internal sourceUrl entirely so the LLM uses
+  // read_file instead of web_fetch (which it refuses on private IPs as SSRF heuristic).
+  if (item.workspacePath) {
+    if (item.kind === "image") {
+      const ps = ["[Image]", `workspacePath=${item.workspacePath}`];
+      if (item.fileName) ps.push(`name=${item.fileName}`);
+      if (item.mimeType) ps.push(`type=${item.mimeType}`);
+      return ps.join(" ");
+    }
+    if (item.kind === "video") {
+      const ps = ["[Video]", `workspacePath=${item.workspacePath}`];
+      if (item.fileName) ps.push(`name=${item.fileName}`);
+      if (item.size) ps.push(`size=${item.size}`);
+      return ps.join(" ");
+    }
+    const ps = ["[File]", `workspacePath=${item.workspacePath}`];
+    if (item.fileName) ps.push(`name=${item.fileName}`);
+    if (item.mimeType) ps.push(`type=${item.mimeType}`);
+    if (item.size) ps.push(`size=${item.size}`);
+    return ps.join(" ");
+  }
+
   if (item.kind === "image") {
     return item.url ? `[Image] ${item.url}` : "[Image message]";
   }
@@ -168,7 +255,9 @@ function extractPictureMedia(msg: MessageItem): InboundMediaItem[] {
   const snapshot = pic.snapshotPicture;
   const url = normalizeString(source?.url) || normalizeString(big?.url) || normalizeString(snapshot?.url);
   const mimeType = normalizeImageMimeType(source?.type) || normalizeImageMimeType(big?.type) || normalizeImageMimeType(snapshot?.type);
-  return [{ kind: "image", url, mimeType }];
+  const sourcePath = normalizeString((pic as any).sourcePath);
+  const sendID = String((msg as any).sendID || "");
+  return [{ kind: "image", url, workspacePath: workspacePathOf(sendID, sourcePath), fileName: sourcePath, mimeType }];
 }
 
 function extractVideoMedia(msg: MessageItem): InboundMediaItem[] {
@@ -189,11 +278,14 @@ function extractVideoMedia(msg: MessageItem): InboundMediaItem[] {
 function extractFileMedia(msg: MessageItem): InboundMediaItem[] {
   const file = msg.fileElem as any;
   if (!file) return [];
+  const fileName = normalizeString(file.fileName);
+  const sendID = String((msg as any).sendID || "");
   return [
     {
       kind: "file",
       url: normalizeString(file.sourceUrl),
-      fileName: normalizeString(file.fileName),
+      workspacePath: workspacePathOf(sendID, fileName),
+      fileName,
       size: normalizeSize(file.fileSize),
       mimeType: normalizeMimeType(file.fileType ?? file.type),
     },
@@ -304,7 +396,9 @@ export async function processInboundMessage(api: any, client: OpenIMClientState,
     return;
   }
 
+  await prefetchInboundMediaToWorkspace(msg);
   const inbound = extractInboundBody(msg);
+  api.logger?.info?.(`[openim] inbound body: ${inbound.body}`);
   if (!inbound.body) {
     api.logger?.info?.(
       `[openim] ignore unsupported message: contentType=${msg.contentType}, clientMsgID=${msg.clientMsgID || "unknown"}`

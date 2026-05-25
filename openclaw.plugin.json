@@ -96,5 +96,13 @@
     "inboundWhitelist": {
       "label": "Inbound Sender Whitelist"
     }
+  },
+  "contracts": {
+    "tools": [
+      "openim_send_text",
+      "openim_send_image",
+      "openim_send_video",
+      "openim_send_file"
+    ]
   }
 }
