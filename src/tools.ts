@@ -54,7 +54,7 @@ export function registerOpenIMTools(api: any): void {
 
   api.registerTool({
     name: "openim_send_image",
-    description: "Send an image via OpenIM. `image` supports a local path or an http(s) URL.",
+    description: "Deliver / forward an image back to the OpenIM user (the same chat surface the current inbound message arrived from). Use this whenever the user asks you to send/give/post/share an image — do NOT use this for visual analysis. `target` must be `user:<senderId>` (use the sender id from the inbound message). `image` is best given as a local workspace path like `/home/node/.openclaw/workspace/<senderId>/<file>`; the plugin has usually already prefetched any file the user attached into that directory.",
     parameters: {
       type: "object",
       properties: {
@@ -78,7 +78,7 @@ export function registerOpenIMTools(api: any): void {
 
   api.registerTool({
     name: "openim_send_video",
-    description: "Send a video via OpenIM (delivered as a file message). `video` supports a local path or URL.",
+    description: "Deliver / forward a video back to the OpenIM user (delivered as a file message). Use when the user asks you to send/share/post a video. `target` must be `user:<senderId>`. `video` is best given as a local workspace path.",
     parameters: {
       type: "object",
       properties: {
@@ -103,7 +103,7 @@ export function registerOpenIMTools(api: any): void {
 
   api.registerTool({
     name: "openim_send_file",
-    description: "Send a file via OpenIM. `file` supports a local path or URL; `name` is optional.",
+    description: "Deliver / forward a file back to the OpenIM user. ALWAYS prefer this over read_file + paste when the user asks to be sent / given / forwarded a file — read_file should only be used when you must inspect contents to answer a question. `target` must be `user:<senderId>` (the sender id from the inbound message). `file` should be a local workspace path like `/home/node/.openclaw/workspace/<senderId>/<file>`; the plugin has usually already prefetched user-attached files into that directory.",
     parameters: {
       type: "object",
       properties: {
